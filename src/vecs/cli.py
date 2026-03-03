@@ -1,6 +1,6 @@
 import click
 
-from vecs.indexer import run_index
+from vecs.indexer import run_index, get_status
 from vecs.searcher import search
 
 
@@ -43,6 +43,16 @@ def search_cmd(query: str, collection: str | None, limit: int):
         if len(text) > 1000:
             text = text[:1000] + "\n... [truncated]"
         click.echo(text)
+
+
+@main.command()
+def status():
+    """Show index status."""
+    s = get_status()
+    click.echo(f"Code chunks:      {s['code_chunks']}")
+    click.echo(f"Session chunks:   {s['session_chunks']}")
+    click.echo(f"Total chunks:     {s['code_chunks'] + s['session_chunks']}")
+    click.echo(f"Tracked files:    {s['manifest_entries']}")
 
 
 # Alias so `vecs search` works

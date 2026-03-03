@@ -25,7 +25,6 @@ from vecs.config import (
     SESSIONS_MODEL,
     VECS_DIR,
     VOYAGE_BATCH_SIZE,
-    VOYAGE_DELAY_SECONDS,
 )
 
 
@@ -60,12 +59,30 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _make_chunk_id(source_key: str, chunk_index: int) -> str:
+    """Generate a deterministic chunk ID from source and index."""
+    return f"{source_key}:{chunk_index}"
+
+
+def _delete_stale_chunks(
+    collection: chromadb.Collection,
+    metadata_key: str,
+    metadata_value: str,
+) -> None:
+    """Delete all existing chunks for a given source before re-indexing."""
+    try:
+        existing = collection.get(where={metadata_key: metadata_value})
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
+    except Exception:
+        pass
+
+
 def _embed_and_store(
     chunks: list[dict],
     collection: chromadb.Collection,
     model: str,
     vo: voyageai.Client,
-    id_prefix: str,
 ) -> int:
     """Embed chunks in batches and store in ChromaDB. Returns count stored."""
     if not chunks:
@@ -82,7 +99,7 @@ def _embed_and_store(
                 break
             except Exception as e:
                 if "RateLimitError" in type(e).__name__ or "rate" in str(e).lower():
-                    wait = VOYAGE_DELAY_SECONDS * (attempt + 1)
+                    wait = 20 * (attempt + 1)
                     _log(f"  Rate limited, waiting {wait}s...")
                     time.sleep(wait)
                 else:
@@ -91,7 +108,7 @@ def _embed_and_store(
             _log(f"  Failed after 5 retries, skipping batch at {i}")
             continue
 
-        ids = [f"{id_prefix}-{i + j}" for j in range(len(batch))]
+        ids = [c["id"] for c in batch]
         metadatas = [c["metadata"] for c in batch]
 
         collection.upsert(
@@ -102,9 +119,6 @@ def _embed_and_store(
         )
         stored += len(batch)
         _log(f"  Indexed {stored}/{len(chunks)} chunks")
-
-        if i + VOYAGE_BATCH_SIZE < len(chunks):
-            time.sleep(VOYAGE_DELAY_SECONDS)
 
     return stored
 
@@ -131,12 +145,16 @@ def index_code(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
     for f in to_index:
         content = f.read_text(errors="replace")
         rel_path = str(f.relative_to(BLOOMLY_CODE_DIR))
+        # Delete old chunks for this file before re-indexing
+        _delete_stale_chunks(collection, "file_path", rel_path)
         chunks = chunk_code_file(
             content, rel_path, CODE_CHUNK_LINES, CODE_CHUNK_OVERLAP
         )
+        for c in chunks:
+            c["id"] = _make_chunk_id(f"code:{rel_path}", c["metadata"]["chunk_index"])
         all_chunks.extend(chunks)
 
-    stored = _embed_and_store(all_chunks, collection, CODE_MODEL, vo, "code")
+    stored = _embed_and_store(all_chunks, collection, CODE_MODEL, vo)
 
     for f in to_index:
         manifest.mark_indexed(f)
@@ -163,12 +181,16 @@ def index_sessions(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
     for f in to_index:
         raw = f.read_text(errors="replace")
         session_id = f.stem
+        # Delete old chunks for this session before re-indexing
+        _delete_stale_chunks(collection, "session_id", session_id)
         messages = preprocess_session(raw)
         chunks = chunk_session(messages, session_id, SESSION_CHUNK_MESSAGES)
+        for c in chunks:
+            c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
         all_chunks.extend(chunks)
 
     stored = _embed_and_store(
-        all_chunks, collection, SESSIONS_MODEL, vo, "session"
+        all_chunks, collection, SESSIONS_MODEL, vo
     )
 
     for f in to_index:
@@ -176,6 +198,33 @@ def index_sessions(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
     manifest.save()
 
     return stored
+
+
+def get_status() -> dict:
+    """Get index status info."""
+    status = {"code_chunks": 0, "session_chunks": 0, "manifest_entries": 0}
+
+    if CHROMADB_DIR.exists():
+        try:
+            db = chromadb.PersistentClient(path=str(CHROMADB_DIR))
+            try:
+                code_col = db.get_collection(CODE_COLLECTION)
+                status["code_chunks"] = code_col.count()
+            except Exception:
+                pass
+            try:
+                sessions_col = db.get_collection(SESSIONS_COLLECTION)
+                status["session_chunks"] = sessions_col.count()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    if MANIFEST_PATH.exists():
+        data = json.loads(MANIFEST_PATH.read_text())
+        status["manifest_entries"] = len(data)
+
+    return status
 
 
 def run_index() -> None:
