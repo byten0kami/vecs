@@ -9,22 +9,23 @@ from pathlib import Path
 import chromadb
 import voyageai
 
-from vecs.chunkers import chunk_code_file, preprocess_session, chunk_session
+from vecs.ast_chunker import chunk_code_file_ast
+from vecs.bm25_index import BM25Index
+from vecs.chunkers import preprocess_session, chunk_session
+from vecs.clients import get_voyage_client, get_chromadb_client
 from vecs.config import (
-    BLOOMLY_CODE_DIR,
-    BLOOMLY_SESSIONS_DIR,
     CHROMADB_DIR,
     CODE_CHUNK_LINES,
     CODE_CHUNK_OVERLAP,
-    CODE_COLLECTION,
-    CODE_EXTENSIONS,
     CODE_MODEL,
     MANIFEST_PATH,
     SESSION_CHUNK_MESSAGES,
-    SESSIONS_COLLECTION,
+    SESSION_CHUNK_OVERLAP,
     SESSIONS_MODEL,
     VECS_DIR,
     VOYAGE_BATCH_SIZE,
+    ProjectConfig,
+    load_config,
 )
 
 
@@ -60,7 +61,6 @@ def _log(msg: str) -> None:
 
 
 def _make_chunk_id(source_key: str, chunk_index: int) -> str:
-    """Generate a deterministic chunk ID from source and index."""
     return f"{source_key}:{chunk_index}"
 
 
@@ -69,7 +69,6 @@ def _delete_stale_chunks(
     metadata_key: str,
     metadata_value: str,
 ) -> None:
-    """Delete all existing chunks for a given source before re-indexing."""
     try:
         existing = collection.get(where={metadata_key: metadata_value})
         if existing["ids"]:
@@ -84,7 +83,6 @@ def _embed_and_store(
     model: str,
     vo: voyageai.Client,
 ) -> int:
-    """Embed chunks in batches and store in ChromaDB. Returns count stored."""
     if not chunks:
         return 0
 
@@ -123,32 +121,35 @@ def _embed_and_store(
     return stored
 
 
-def index_code(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
-    """Index Bloomly .cs files from Assets/. Returns count of new chunks."""
+def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+    """Index code files for a project. Returns count of new chunks."""
     manifest = Manifest()
-    collection = db.get_or_create_collection(CODE_COLLECTION)
+    collection = db.get_or_create_collection(project.code_collection)
+
+    if not project.code_dir.exists():
+        _log(f"Code dir not found: {project.code_dir}")
+        return 0
 
     files = [
         f
-        for f in BLOOMLY_CODE_DIR.rglob("*")
-        if f.suffix in CODE_EXTENSIONS and f.is_file()
+        for f in project.code_dir.rglob("*")
+        if f.suffix in project.extensions and f.is_file()
     ]
 
     to_index = [f for f in files if manifest.needs_indexing(f)]
     if not to_index:
-        _log("Code: nothing new to index.")
+        _log(f"[{project.name}] Code: nothing new to index.")
         return 0
 
-    _log(f"Code: {len(to_index)} files to index ({len(files)} total)")
+    _log(f"[{project.name}] Code: {len(to_index)} files to index ({len(files)} total)")
 
     all_chunks = []
     for f in to_index:
         content = f.read_text(errors="replace")
-        rel_path = str(f.relative_to(BLOOMLY_CODE_DIR))
-        # Delete old chunks for this file before re-indexing
+        rel_path = str(f.relative_to(project.code_dir))
         _delete_stale_chunks(collection, "file_path", rel_path)
-        chunks = chunk_code_file(
-            content, rel_path, CODE_CHUNK_LINES, CODE_CHUNK_OVERLAP
+        chunks = chunk_code_file_ast(
+            content, rel_path, chunk_lines=CODE_CHUNK_LINES, overlap=CODE_CHUNK_OVERLAP
         )
         for c in chunks:
             c["id"] = _make_chunk_id(f"code:{rel_path}", c["metadata"]["chunk_index"])
@@ -160,82 +161,144 @@ def index_code(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
         manifest.mark_indexed(f)
     manifest.save()
 
+    # Build BM25 index for this project
+    bm25_dir = VECS_DIR / "bm25"
+    bm25_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        all_docs = collection.get(include=["documents"])
+        bm25_docs = [
+            {"id": id_, "text": text}
+            for id_, text in zip(all_docs["ids"], all_docs["documents"])
+        ]
+        bm25 = BM25Index(bm25_dir / f"{project.name}_code.pkl")
+        bm25.build(bm25_docs)
+        bm25.save()
+    except Exception:
+        pass  # BM25 is best-effort
+
     return stored
 
 
-def index_sessions(vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
-    """Index Claude Code session transcripts. Returns count of new chunks."""
-    manifest = Manifest()
-    collection = db.get_or_create_collection(SESSIONS_COLLECTION)
+def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+    """Index Claude Code session transcripts for a project."""
+    if not project.sessions_dir or not project.sessions_dir.exists():
+        return 0
 
-    files = sorted(BLOOMLY_SESSIONS_DIR.glob("*.jsonl"))
+    manifest = Manifest()
+    collection = db.get_or_create_collection(project.sessions_collection)
+
+    files = sorted(project.sessions_dir.glob("*.jsonl"))
     to_index = [f for f in files if manifest.needs_indexing(f)]
 
     if not to_index:
-        _log("Sessions: nothing new to index.")
+        _log(f"[{project.name}] Sessions: nothing new to index.")
         return 0
 
-    _log(f"Sessions: {len(to_index)} files to index ({len(files)} total)")
+    _log(f"[{project.name}] Sessions: {len(to_index)} files to index ({len(files)} total)")
 
     all_chunks = []
     for f in to_index:
         raw = f.read_text(errors="replace")
         session_id = f.stem
-        # Delete old chunks for this session before re-indexing
         _delete_stale_chunks(collection, "session_id", session_id)
         messages = preprocess_session(raw)
-        chunks = chunk_session(messages, session_id, SESSION_CHUNK_MESSAGES)
+        chunks = chunk_session(
+            messages, session_id, SESSION_CHUNK_MESSAGES, overlap=SESSION_CHUNK_OVERLAP
+        )
         for c in chunks:
             c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
         all_chunks.extend(chunks)
 
-    stored = _embed_and_store(
-        all_chunks, collection, SESSIONS_MODEL, vo
-    )
+    stored = _embed_and_store(all_chunks, collection, SESSIONS_MODEL, vo)
 
     for f in to_index:
         manifest.mark_indexed(f)
     manifest.save()
 
+    # Build BM25 index for this project
+    bm25_dir = VECS_DIR / "bm25"
+    bm25_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        all_docs = collection.get(include=["documents"])
+        bm25_docs = [
+            {"id": id_, "text": text}
+            for id_, text in zip(all_docs["ids"], all_docs["documents"])
+        ]
+        bm25 = BM25Index(bm25_dir / f"{project.name}_sessions.pkl")
+        bm25.build(bm25_docs)
+        bm25.save()
+    except Exception:
+        pass  # BM25 is best-effort
+
     return stored
 
 
-def get_status() -> dict:
-    """Get index status info."""
-    status = {"code_chunks": 0, "session_chunks": 0, "manifest_entries": 0}
+def get_status(project_name: str | None = None) -> dict:
+    """Get index status info, optionally filtered to one project."""
+    config = load_config()
+    db = get_chromadb_client()
+    projects = (
+        {project_name: config.projects[project_name]}
+        if project_name and project_name in config.projects
+        else config.projects
+    )
 
-    if CHROMADB_DIR.exists():
+    status: dict = {"projects": {}, "total_code_chunks": 0, "total_session_chunks": 0}
+
+    for name, p in projects.items():
+        code_count = 0
+        session_count = 0
         try:
-            db = chromadb.PersistentClient(path=str(CHROMADB_DIR))
-            try:
-                code_col = db.get_collection(CODE_COLLECTION)
-                status["code_chunks"] = code_col.count()
-            except Exception:
-                pass
-            try:
-                sessions_col = db.get_collection(SESSIONS_COLLECTION)
-                status["session_chunks"] = sessions_col.count()
-            except Exception:
-                pass
+            col = db.get_collection(p.code_collection)
+            code_count = col.count()
         except Exception:
             pass
+        try:
+            col = db.get_collection(p.sessions_collection)
+            session_count = col.count()
+        except Exception:
+            pass
+        status["projects"][name] = {
+            "code_chunks": code_count,
+            "session_chunks": session_count,
+        }
+        status["total_code_chunks"] += code_count
+        status["total_session_chunks"] += session_count
 
     if MANIFEST_PATH.exists():
         data = json.loads(MANIFEST_PATH.read_text())
         status["manifest_entries"] = len(data)
+    else:
+        status["manifest_entries"] = 0
 
     return status
 
 
-def run_index() -> None:
-    """Run full incremental index."""
+def run_index(project_name: str | None = None) -> None:
+    """Run incremental index for one or all projects."""
     VECS_DIR.mkdir(parents=True, exist_ok=True)
     CHROMADB_DIR.mkdir(parents=True, exist_ok=True)
 
-    vo = voyageai.Client()
-    db = chromadb.PersistentClient(path=str(CHROMADB_DIR))
+    config = load_config()
+    if not config.projects:
+        _log("No projects configured. Use 'vecs project add' to register one.")
+        return
+
+    vo = get_voyage_client()
+    db = get_chromadb_client()
+
+    projects = (
+        {project_name: config.projects[project_name]}
+        if project_name and project_name in config.projects
+        else config.projects
+    )
 
     _log("Starting index...")
-    code_count = index_code(vo, db)
-    session_count = index_sessions(vo, db)
-    _log(f"Done. Indexed {code_count} code chunks, {session_count} session chunks.")
+    total_code = 0
+    total_sessions = 0
+    for name, project in projects.items():
+        _log(f"\nProject: {name}")
+        total_code += index_code(project, vo, db)
+        total_sessions += index_sessions(project, vo, db)
+
+    _log(f"\nDone. Indexed {total_code} code chunks, {total_sessions} session chunks.")

@@ -100,11 +100,15 @@ def chunk_session(
     messages: list[dict],
     session_id: str,
     chunk_size: int = 10,
+    overlap: int = 0,
 ) -> list[dict]:
-    """Group preprocessed messages into chunks."""
+    """Group preprocessed messages into overlapping chunks."""
     chunks = []
-    for i in range(0, len(messages), chunk_size):
-        group = messages[i : i + chunk_size]
+    step = max(1, chunk_size - overlap)
+    start = 0
+
+    while start < len(messages):
+        group = messages[start : start + chunk_size]
         combined = "\n\n".join(
             f"[{m['role']}]: {m['text']}" for m in group
         )
@@ -122,4 +126,8 @@ def chunk_session(
                 },
             }
         )
+        if start + chunk_size >= len(messages):
+            break
+        start += step
+
     return chunks

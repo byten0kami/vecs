@@ -54,3 +54,15 @@ def test_chunk_session_groups_messages():
     chunks = chunk_session(messages, session_id="test", chunk_size=10)
     assert len(chunks) >= 2
     assert chunks[0]["metadata"]["session_id"] == "test"
+
+
+def test_chunk_session_with_overlap():
+    """Session chunks overlap by N messages."""
+    lines = [_make_message("user", f"msg {i}") for i in range(15)]
+    messages = preprocess_session("\n".join(lines))
+    chunks = chunk_session(messages, session_id="test", chunk_size=10, overlap=2)
+    assert len(chunks) == 2
+    # Second chunk should start 2 messages before where first chunk ended
+    # First chunk: msgs 0-9, second chunk: msgs 8-14
+    assert "msg 8" in chunks[1]["text"]
+    assert "msg 9" in chunks[1]["text"]
