@@ -25,6 +25,7 @@ from vecs.config import (
     SESSIONS_MODEL,
     VECS_DIR,
     VOYAGE_BATCH_SIZE,
+    VOYAGE_DELAY_SECONDS,
 )
 
 
@@ -70,10 +71,9 @@ def _embed_and_store(
     if not chunks:
         return 0
 
-    batch_size = min(VOYAGE_BATCH_SIZE, 10)
     stored = 0
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
+    for i in range(0, len(chunks), VOYAGE_BATCH_SIZE):
+        batch = chunks[i : i + VOYAGE_BATCH_SIZE]
         texts = [c["text"] for c in batch]
 
         for attempt in range(5):
@@ -82,7 +82,7 @@ def _embed_and_store(
                 break
             except Exception as e:
                 if "RateLimitError" in type(e).__name__ or "rate" in str(e).lower():
-                    wait = 20 * (attempt + 1)
+                    wait = VOYAGE_DELAY_SECONDS * (attempt + 1)
                     _log(f"  Rate limited, waiting {wait}s...")
                     time.sleep(wait)
                 else:
@@ -103,8 +103,8 @@ def _embed_and_store(
         stored += len(batch)
         _log(f"  Indexed {stored}/{len(chunks)} chunks")
 
-        if i + batch_size < len(chunks):
-            time.sleep(21)
+        if i + VOYAGE_BATCH_SIZE < len(chunks):
+            time.sleep(VOYAGE_DELAY_SECONDS)
 
     return stored
 
